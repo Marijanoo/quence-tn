@@ -1,0 +1,31 @@
+import { contextBridge, ipcRenderer } from 'electron'
+
+contextBridge.exposeInMainWorld('electronAPI', {
+  minimize: () => ipcRenderer.send('window-minimize'),
+  maximize: () => ipcRenderer.send('window-maximize'),
+  close:    () => ipcRenderer.send('window-close'),
+  zoomIn:   () => ipcRenderer.send('window-zoom-in'),
+  zoomOut:  () => ipcRenderer.send('window-zoom-out'),
+  onUpdateAvailable:  (cb: () => void) => ipcRenderer.on('update-available', cb),
+  onUpdateProgress:   (cb: (percent: number) => void) => ipcRenderer.on('update-progress', (_e, percent) => cb(percent)),
+  onUpdateDownloaded: (cb: () => void) => ipcRenderer.on('update-downloaded', cb),
+  installUpdate: () => ipcRenderer.send('install-update'),
+  pty: {
+    create:  (id: string, cols: number, rows: number, cwd?: string) => ipcRenderer.invoke('pty:create', { id, cols, rows, cwd }),
+    ready:   (id: string) => ipcRenderer.send('pty:ready', { id }),
+    write:   (id: string, data: string) => ipcRenderer.send('pty:write', { id, data }),
+    line:    (id: string, line: string) => ipcRenderer.send('pty:line', { id, line }),
+    resize:  (id: string, cols: number, rows: number) => ipcRenderer.send('pty:resize', { id, cols, rows }),
+    kill:    (id: string) => ipcRenderer.invoke('pty:kill', { id }),
+    popout:  (id: string, title: string) => ipcRenderer.invoke('pty:popout', { id, title }),
+    homedir: () => ipcRenderer.invoke('pty:homedir'),
+    onData:  (id: string, cb: (data: string) => void) => ipcRenderer.on(`pty:data:${id}`, (_e, data) => cb(data)),
+    onExit:  (id: string, cb: () => void) => ipcRenderer.on(`pty:exit:${id}`, cb),
+    offData: (id: string) => ipcRenderer.removeAllListeners(`pty:data:${id}`),
+    offExit: (id: string) => ipcRenderer.removeAllListeners(`pty:exit:${id}`),
+    stats:   (ids: string[]) => ipcRenderer.invoke('pty:stats', { ids }),
+    onPopoutClosed: (cb: (id: string) => void) => ipcRenderer.on('pty:popout-closed', (_e, id) => cb(id)),
+    onPopIn:        (cb: (id: string) => void) => ipcRenderer.on('pty:popin', (_e, id) => cb(id)),
+    popIn:          (id: string) => ipcRenderer.send('pty:popin', { id }),
+  },
+})
