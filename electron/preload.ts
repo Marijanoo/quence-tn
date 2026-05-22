@@ -27,5 +27,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onPopoutClosed: (cb: (id: string) => void) => ipcRenderer.on('pty:popout-closed', (_e, id) => cb(id)),
     onPopIn:        (cb: (id: string) => void) => ipcRenderer.on('pty:popin', (_e, id) => cb(id)),
     popIn:          (id: string) => ipcRenderer.send('pty:popin', { id }),
+    setSnapshot:    (id: string, data: string) => ipcRenderer.invoke('pty:set-snapshot', { id, data }),
+    getSnapshot:    (id: string) => ipcRenderer.invoke('pty:get-snapshot', { id }),
+    saveState:      (state: unknown) => ipcRenderer.invoke('pty:save-state', state),
+    loadState:      () => ipcRenderer.invoke('pty:load-state'),
+    claim:          (ids: string[]) => ipcRenderer.invoke('pty:claim', { ids }),
   },
 })

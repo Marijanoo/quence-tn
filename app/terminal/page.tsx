@@ -45,76 +45,94 @@ export default function TerminalPopout() {
     if (id) setTermId(id)
     if (!id || !window.electronAPI?.pty) return
 
-    const term = new Terminal({
-      fontFamily: '"Cascadia Code", "Fira Code", Consolas, monospace',
-      fontSize: 12,
-      lineHeight: 1.35,
-      cursorBlink: true,
-      cursorStyle: 'bar',
-      theme: getTermTheme(),
-    })
+    // Cleanup refs so the async setup can register cleanup even after await
+    let rafId = 0
+    let ro: ResizeObserver | null = null
+    let term: Terminal | null = null
+    let onPaste: ((e: Event) => void) | null = null
+    let onContextMenu: ((e: Event) => void) | null = null
+    let cleanedUp = false
 
-    const fitAddon = new FitAddon()
-    term.loadAddon(fitAddon)
-    term.loadAddon(new WebLinksAddon())
-    term.open(containerRef.current!)
-    fitAddon.fit()
+    ;(async () => {
+      const t2 = new Terminal({
+        fontFamily: '"Cascadia Code", "Fira Code", Consolas, monospace',
+        fontSize: 12,
+        lineHeight: 1.35,
+        cursorBlink: true,
+        cursorStyle: 'bar',
+        theme: getTermTheme(),
+      })
+      term = t2
 
-    window.electronAPI.pty.onData(id, data => term.write(data))
-    window.electronAPI.pty.onExit(id, () => term.write('\r\n\x1b[90m[process exited]\x1b[0m\r\n'))
-    window.electronAPI.pty.ready(id)
+      const fitAddon = new FitAddon()
+      t2.loadAddon(fitAddon)
+      t2.loadAddon(new WebLinksAddon())
+      t2.open(containerRef.current!)
+      fitAddon.fit()
 
-    term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
-      if (e.type !== 'keydown') return true
-      const mod = e.ctrlKey || e.metaKey
-      if ((mod && e.key === 'v') || (e.ctrlKey && e.shiftKey && e.key === 'V')) {
+      // Replay scrollback snapshot from main window, then subscribe to live data
+      const snapshot = await window.electronAPI!.pty.getSnapshot?.(id)
+      if (cleanedUp) { t2.dispose(); return }
+      if (snapshot) {
+        t2.write(snapshot + '\r\n')
+      }
+
+      window.electronAPI!.pty.onData(id, data => t2.write(data))
+      window.electronAPI!.pty.onExit(id, () => t2.write('\r\n\x1b[90m[process exited]\x1b[0m\r\n'))
+      window.electronAPI!.pty.ready(id)
+
+      t2.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+        if (e.type !== 'keydown') return true
+        const mod = e.ctrlKey || e.metaKey
+        if ((mod && e.key === 'v') || (e.ctrlKey && e.shiftKey && e.key === 'V')) {
+          navigator.clipboard.readText().then(text => {
+            if (text) try { window.electronAPI!.pty.write(id, text) } catch {}
+          }).catch(() => {})
+          return false
+        }
+        if ((mod && e.key === 'c') || (e.ctrlKey && e.shiftKey && e.key === 'C')) {
+          if (t2.hasSelection()) { navigator.clipboard.writeText(t2.getSelection()).catch(() => {}); return false }
+          if (e.shiftKey) return false
+          return true
+        }
+        return true
+      })
+
+      onPaste = (e: Event) => e.preventDefault()
+      containerRef.current?.addEventListener('paste', onPaste, true)
+      onContextMenu = (e: Event) => {
+        e.preventDefault()
         navigator.clipboard.readText().then(text => {
           if (text) try { window.electronAPI!.pty.write(id, text) } catch {}
         }).catch(() => {})
-        return false
       }
-      if ((mod && e.key === 'c') || (e.ctrlKey && e.shiftKey && e.key === 'C')) {
-        if (term.hasSelection()) { navigator.clipboard.writeText(term.getSelection()).catch(() => {}); return false }
-        if (e.shiftKey) return false
-        return true
-      }
-      return true
-    })
+      containerRef.current?.addEventListener('contextmenu', onContextMenu, true)
 
-    const onPaste = (e: Event) => e.preventDefault()
-    containerRef.current?.addEventListener('paste', onPaste, true)
-    const onContextMenu = (e: Event) => {
-      e.preventDefault()
-      navigator.clipboard.readText().then(text => {
-        if (text) try { window.electronAPI!.pty.write(id, text) } catch {}
-      }).catch(() => {})
-    }
-    containerRef.current?.addEventListener('contextmenu', onContextMenu, true)
+      t2.onData(data => { try { window.electronAPI!.pty.write(id, data) } catch {} })
 
-    term.onData(data => { try { window.electronAPI!.pty.write(id, data) } catch {} })
-
-    let rafId = 0
-    const ro = new ResizeObserver(() => {
-      cancelAnimationFrame(rafId)
-      rafId = requestAnimationFrame(() => {
-        try {
-          const el = containerRef.current
-          if (!el || el.offsetWidth === 0 || el.offsetHeight === 0) return
-          fitAddon.fit()
-          window.electronAPI!.pty.resize(id, term.cols, term.rows)
-        } catch {}
+      ro = new ResizeObserver(() => {
+        cancelAnimationFrame(rafId)
+        rafId = requestAnimationFrame(() => {
+          try {
+            const el = containerRef.current
+            if (!el || el.offsetWidth === 0 || el.offsetHeight === 0) return
+            fitAddon.fit()
+            window.electronAPI!.pty.resize(id, t2.cols, t2.rows)
+          } catch {}
+        })
       })
-    })
-    ro.observe(containerRef.current!)
+      ro.observe(containerRef.current!)
+    })()
 
     return () => {
+      cleanedUp = true
       cancelAnimationFrame(rafId)
-      ro.disconnect()
-      containerRef.current?.removeEventListener('paste', onPaste, true)
-      containerRef.current?.removeEventListener('contextmenu', onContextMenu, true)
+      ro?.disconnect()
+      if (onPaste) containerRef.current?.removeEventListener('paste', onPaste, true)
+      if (onContextMenu) containerRef.current?.removeEventListener('contextmenu', onContextMenu, true)
       window.electronAPI!.pty.offData(id)
       window.electronAPI!.pty.offExit(id)
-      term.dispose()
+      term?.dispose()
     }
   }, [])
 

@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "build:electron": "tsc -p electron/tsconfig.json",
-    "electron:dev": "concurrently --kill-others \"npm run dev\" \"wait-on tcp:3000 && npm run build:electron && electron .\"",
+    "electron:dev": "concurrently --kill-others \"npm run dev\" \"wait-on tcp:3002 && npm run build:electron && electron . 3002\"",
     "rebuild": "electron-rebuild -f -w node-pty",
     "electron:build": "npm run build && npm run build:electron && electron-builder",
     "build:electron-win": "npm run build && npm run build:electron && electron-builder --win --publish never",

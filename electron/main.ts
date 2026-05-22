@@ -103,6 +103,9 @@ async function createWindow() {
     if (input.key === 'F12') {
       if (!isProd) mainWindow!.webContents.toggleDevTools()
       event.preventDefault()
+    } else if ((input.control || input.meta) && input.key === 'r') {
+      // Block Ctrl/Cmd+R — reloading resets terminal state
+      event.preventDefault()
     } else if ((input.control || input.meta) && (input.key === '=' || input.key === '+')) {
       mainWindow!.webContents.setZoomLevel(mainWindow!.webContents.getZoomLevel() + 0.5)
       event.preventDefault()
@@ -115,8 +118,17 @@ async function createWindow() {
     }
   })
 
+  // Block all reload attempts — will-reload covers navigation reloads,
+  // will-navigate covers location.reload() called from inside the page (e.g. Next.js HMR)
   mainWindow.webContents.on('will-reload' as any, (event: Electron.Event) => {
     event.preventDefault()
+  })
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const currentURL = mainWindow!.webContents.getURL()
+    // Allow the initial load; block any navigation back to the same URL (i.e. a reload)
+    if (currentURL && new URL(url).href === new URL(currentURL).href) {
+      event.preventDefault()
+    }
   })
 
   mainWindow.on('resize', saveWindowState)
@@ -149,11 +161,14 @@ app.on('ready', () => {
   const termAlive = new Map<string, boolean>()
   const termResizeReady = new Map<string, boolean>()
   const termPopouts = new Map<string, BrowserWindow>()
+  const termSnapshots = new Map<string, string>()
+  const termDataDisposables = new Map<string, { dispose: () => void }>()
 
   function destroyTerm(id: string) {
     if (!termAlive.get(id)) return
     termAlive.set(id, false)
     termResizeReady.delete(id)
+    termDataDisposables.delete(id)
     const proc = termProcesses.get(id)
     if (proc) {
       const origWrite = process.stderr.write.bind(process.stderr) as typeof process.stderr.write
@@ -173,6 +188,10 @@ app.on('ready', () => {
     const popout = termPopouts.get(id)
     if (popout && !popout.isDestroyed()) {
       popout.webContents.send(`pty:data:${id}`, data)
+      // Also keep the main window xterm in sync so pop-back-in retains history
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(`pty:data:${id}`, data)
+      }
       return
     }
     if (!mainWindow || mainWindow.isDestroyed()) return
@@ -180,7 +199,17 @@ app.on('ready', () => {
   }
 
   ipcMain.handle('pty:create', (_e, { id, cols, rows, cwd }: { id: string; cols: number; rows: number; cwd?: string }) => {
-    if (termAlive.get(id) && termProcesses.has(id)) return { ok: true, reattached: true }
+    if (termAlive.get(id) && termProcesses.has(id)) {
+      // PTY already running — renderer reloaded. Dispose old onData listener, re-register for new window.
+      termDataDisposables.get(id)?.dispose()
+      const proc = termProcesses.get(id)!
+      const disposable = proc.onData(data => {
+        if (!termAlive.get(id)) return
+        sendToTerm(id, data)
+      })
+      termDataDisposables.set(id, disposable)
+      return { ok: true, reattached: true }
+    }
     destroyTerm(id)
 
     const isWin = process.platform === 'win32'
@@ -208,10 +237,11 @@ app.on('ready', () => {
     termAlive.set(id, true)
     setTimeout(() => { if (termAlive.get(id)) termResizeReady.set(id, true) }, 1000)
 
-    proc.onData(data => {
+    const dataDisposable = proc.onData(data => {
       if (!termAlive.get(id)) return
       sendToTerm(id, data)
     })
+    termDataDisposables.set(id, dataDisposable)
 
     proc.onExit(() => {
       sendToTerm(id, `\r\n\x1b[90m[process exited]\x1b[0m\r\n`)
@@ -291,7 +321,40 @@ app.on('ready', () => {
     return { ok: true }
   })
 
+  ipcMain.handle('pty:set-snapshot', (_e, { id, data }: { id: string; data: string }) => {
+    termSnapshots.set(id, data)
+    return { ok: true }
+  })
+
+  ipcMain.handle('pty:get-snapshot', (_e, { id }: { id: string }) => {
+    return termSnapshots.get(id) ?? ''
+  })
+
   ipcMain.handle('pty:homedir', () => os.homedir())
+
+  // Persist terminal tab state to a file so it survives renderer reloads
+  const termStatePath = path.join(app.getPath('userData'), 'terminal-state.json')
+
+  ipcMain.handle('pty:save-state', (_e, state: unknown) => {
+    try { fs.writeFileSync(termStatePath, JSON.stringify(state), 'utf-8') } catch {}
+    return { ok: true }
+  })
+
+  ipcMain.handle('pty:load-state', () => {
+    try {
+      const raw = fs.readFileSync(termStatePath, 'utf-8')
+      return JSON.parse(raw)
+    } catch { return null }
+  })
+
+  // Kill any PTYs not claimed by the renderer on mount (orphans from a previous reload)
+  ipcMain.handle('pty:claim', (_e, { ids }: { ids: string[] }) => {
+    const claimed = new Set(ids)
+    for (const id of [...termProcesses.keys()]) {
+      if (!claimed.has(id)) destroyTerm(id)
+    }
+    return { ok: true }
+  })
 
   ipcMain.handle('pty:stats', async (_e, { ids }: { ids: string[] }) => {
     const pids = ids.map(id => termProcesses.get(id)?.pid).filter((p): p is number => p != null)
@@ -335,36 +398,25 @@ if (isProd) {
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = true
 
-  autoUpdater.setFeedURL({
-    provider: 'github',
-    owner: 'Marijanoo',
-    repo: 'quence-tn',
-  })
+  if (process.platform === 'darwin') {
+    autoUpdater.channel = 'latest'
+  }
 
-  autoUpdater.on('update-available', (info) => {
-    log.info('[updater] Update available:', info.version)
-    mainWindow?.webContents.send('update-available')
-  })
-  autoUpdater.on('update-not-available', (info) => {
-    log.info('[updater] Already up to date:', info.version)
-  })
+  autoUpdater.setFeedURL({ provider: 'github', owner: 'Marijanoo', repo: 'quence-tn' })
+
+  autoUpdater.on('checking-for-update', () => { log.info('[updater] Checking for update…') })
+  autoUpdater.on('update-available', (info) => { log.info('[updater] Update available:', info.version); mainWindow?.webContents.send('update-available') })
+  autoUpdater.on('update-not-available', (info) => { log.info('[updater] Already up to date:', info.version) })
   autoUpdater.on('download-progress', (info) => {
-    log.info(`[updater] Downloading… ${info.percent.toFixed(1)}%`)
+    log.info(`[updater] Downloading… ${info.percent.toFixed(1)}% (${(info.transferred / 1024 / 1024).toFixed(1)} / ${(info.total / 1024 / 1024).toFixed(1)} MB)`)
     mainWindow?.webContents.send('update-progress', info.percent)
   })
-  autoUpdater.on('update-downloaded', (info) => {
-    log.info('[updater] Downloaded:', info.version)
-    mainWindow?.webContents.send('update-downloaded')
-  })
-  autoUpdater.on('error', (err) => {
-    log.error('[updater] Error:', err?.message ?? err)
-  })
+  autoUpdater.on('update-downloaded', (info) => { log.info('[updater] Update downloaded, ready to install:', info.version); mainWindow?.webContents.send('update-downloaded') })
+  autoUpdater.on('error', (err) => { log.error('[updater] Error:', err?.message ?? err) })
 
   process.on('unhandledRejection', () => {})
 
-  ipcMain.on('install-update', () => {
-    autoUpdater.quitAndInstall(true, false)
-  })
+  ipcMain.on('install-update', () => { log.info('[updater] install-update requested, calling quitAndInstall'); autoUpdater.quitAndInstall(true, false) })
 
   app.on('browser-window-created', (_, win) => {
     win.webContents.once('did-finish-load', () => {

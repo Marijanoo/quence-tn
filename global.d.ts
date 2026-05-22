@@ -29,6 +29,11 @@ declare global {
         onPopoutClosed: (cb: (id: string) => void) => void
         onPopIn:        (cb: (id: string) => void) => void
         popIn:          (id: string) => void
+        setSnapshot?:   (id: string, data: string) => Promise<{ ok: boolean }>
+        getSnapshot?:   (id: string) => Promise<string>
+        saveState?:     (state: unknown) => Promise<{ ok: boolean }>
+        loadState?:     () => Promise<unknown>
+        claim?:         (ids: string[]) => Promise<{ ok: boolean }>
       }
     }
   }

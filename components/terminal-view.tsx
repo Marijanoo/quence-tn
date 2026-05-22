@@ -42,6 +42,7 @@ interface TermTab {
 
 interface TerminalPaneHandle {
   copyOutput: () => void
+  getSnapshot: () => string
 }
 
 const TerminalPane = forwardRef<TerminalPaneHandle, { id: string; isVisible: boolean; cwd: string; onKill: () => void; onCwdChange: (cwd: string) => void }>(
@@ -64,6 +65,29 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
         lines.push(buf.getLine(i)?.translateToString(true) ?? '')
       }
       navigator.clipboard.writeText(lines.join('\n').trimEnd())
+    },
+    getSnapshot: () => {
+      const term = termRef.current
+      if (!term) return ''
+      const buf = term.buffer.active
+      const lines: string[] = []
+      for (let i = 0; i < buf.length; i++) {
+        lines.push(buf.getLine(i)?.translateToString(true) ?? '')
+      }
+      // Trim trailing blank lines
+      let end = lines.length - 1
+      while (end > 0 && lines[end] === '') end--
+      const trimmed = lines.slice(0, end + 1)
+      // Collapse runs of blank lines to a single blank line
+      const collapsed: string[] = []
+      let prevBlank = false
+      for (const line of trimmed) {
+        const blank = line === ''
+        if (blank && prevBlank) continue
+        collapsed.push(line)
+        prevBlank = blank
+      }
+      return collapsed.join('\r\n')
     },
   }))
 
@@ -204,17 +228,7 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
   return <div ref={containerRef} className="w-full h-full" style={{ padding: '4px 6px' }} />
 })
 
-const STORAGE_KEY = 'terminal-tabs'
-
-interface SavedTerm { title: string; cwd: string; counter: number }
-
-function loadSavedTerms(): SavedTerm[] {
-  try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
-  } catch {
-    return []
-  }
-}
+interface SavedState { terms: { id: string; title: string; cwd: string }[]; counter: number }
 
 // Match a Windows cmd prompt like "C:\Users\Foo>" — strip ANSI escape codes first
 const PROMPT_RE = /([A-Za-z]:[^\r\n>]*?)>/
@@ -230,6 +244,8 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
   const counterRef = useRef(1)
   const paneRefs = useRef<Map<string, TerminalPaneHandle>>(new Map())
   const dragIdRef = useRef<string | null>(null)
+  const initializedRef = useRef(false)
+  const termsRef = useRef<TermTab[]>([])
 
   // Report count to parent
   useEffect(() => { onCountChange?.(terms.length) }, [terms.length, onCountChange])
@@ -241,39 +257,64 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
     window.electronAPI?.pty.onPopIn?.(clear)
   }, [])
 
-  // Persist terminal list whenever it changes
+  // Keep termsRef in sync so save helper always has fresh state
+  useEffect(() => { termsRef.current = terms }, [terms])
+
+  // Save to main-process file whenever terms change (survives renderer reloads)
   useEffect(() => {
-    if (terms.length === 0) return
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(
-      terms.map(t => ({ title: t.title, cwd: t.cwd, counter: counterRef.current }))
-    ))
+    if (!initializedRef.current) return
+    const state: SavedState | null = terms.length > 0
+      ? { terms: terms.map(t => ({ id: t.id, title: t.title, cwd: t.cwd })), counter: counterRef.current }
+      : null
+    window.electronAPI?.pty.saveState?.(state)
   }, [terms])
 
+  // Init: load state from main process, claim live PTY IDs, kill orphans
   useEffect(() => {
     if (!window.electronAPI?.pty) return
-    window.electronAPI.pty.homedir().then(h => {
-      setHomedir(h)
-      const saved = loadSavedTerms()
-      if (saved.length > 0) {
-        const restored = saved.map(s => ({
-          id: generateId(),
+    Promise.all([
+      window.electronAPI.pty.homedir(),
+      window.electronAPI.pty.loadState?.() as Promise<unknown>,
+    ]).then(([h, raw]) => {
+      setHomedir(h as string)
+      const saved = (() => {
+        try {
+          if (!raw || typeof raw !== 'object') return null
+          const s = raw as SavedState
+          if (!Array.isArray(s.terms)) return null
+          return s
+        } catch { return null }
+      })()
+      initializedRef.current = true
+      if (saved && saved.terms.length > 0) {
+        const restored = saved.terms.map(s => ({
+          id: s.id || generateId(),
           title: s.title,
-          cwd: s.cwd || h,
+          cwd: s.cwd || (h as string),
         }))
-        counterRef.current = saved[saved.length - 1].counter
+        counterRef.current = saved.counter
+        termsRef.current = restored
         setTerms(restored)
         setActiveTermId(restored[0].id)
+        // Kill any PTYs from a previous session that we're not restoring
+        window.electronAPI!.pty.claim?.(restored.map(t => t.id))
       } else {
-        const id = generateId()
-        setTerms([{ id, title: `Terminal ${counterRef.current++}`, cwd: h }])
-        setActiveTermId(id)
+        const initial = [{ id: generateId(), title: `Terminal ${counterRef.current++}`, cwd: h as string }]
+        termsRef.current = initial
+        setTerms(initial)
+        setActiveTermId(initial[0].id)
+        window.electronAPI!.pty.claim?.(initial.map(t => t.id))
       }
     })
   }, [])
 
   const addTerm = useCallback(() => {
     const id = generateId()
-    setTerms(prev => [...prev, { id, title: `Terminal ${counterRef.current++}`, cwd: homedir }])
+    setTerms(prev => {
+      const next = [...prev, { id, title: `Terminal ${counterRef.current++}`, cwd: homedir }]
+      termsRef.current = next
+      return next
+    })
     setActiveTermId(id)
   }, [homedir])
 
@@ -283,14 +324,18 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
     setPoppedOutIds(prev => { const next = new Set(prev); next.delete(id); return next })
     setTerms(prev => {
       const next = prev.filter(t => t.id !== id)
-      if (next.length === 0) localStorage.removeItem(STORAGE_KEY)
+      termsRef.current = next
       return next
     })
     setActiveTermId(prev => prev === id ? null : prev)
   }, [])
 
   const updateTermCwd = useCallback((id: string, newCwd: string) => {
-    setTerms(prev => prev.map(t => t.id === id ? { ...t, cwd: newCwd } : t))
+    setTerms(prev => {
+      const next = prev.map(t => t.id === id ? { ...t, cwd: newCwd } : t)
+      termsRef.current = next
+      return next
+    })
   }, [])
 
   useEffect(() => {
@@ -322,13 +367,11 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
     })
   }, [])
 
-  const rowCount = Math.ceil((terms.length + 1) / 2)
-
   return (
     <div className="flex flex-col w-full h-full bg-background overflow-hidden">
       <div
         className="grid grid-cols-2 gap-3 p-3 flex-1 min-h-0"
-        style={{ gridTemplateRows: `repeat(${rowCount}, minmax(0, 1fr))` }}
+        style={{ gridTemplateRows: 'repeat(2, minmax(0, 1fr))' }}
       >
         {terms.map(term => (
           <div
@@ -376,7 +419,9 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
                   : <Copy className="h-3.5 w-3.5" />}
               </button>
               <button
-                onClick={() => {
+                onClick={async () => {
+                  const snapshot = paneRefs.current.get(term.id)?.getSnapshot() ?? ''
+                  if (snapshot) await window.electronAPI?.pty.setSnapshot?.(term.id, snapshot)
                   window.electronAPI?.pty.popout?.(term.id, term.title)
                   setPoppedOutIds(prev => new Set(prev).add(term.id))
                 }}
@@ -397,43 +442,48 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
                 <X className="h-3.5 w-3.5" />
               </button>
             </div>
-            <div className="flex-1 min-h-0" style={{ background: 'var(--term-bg, #0f0f0f)' }}>
-              {poppedOutIds.has(term.id) ? (
-                <div className="w-full h-full flex flex-col items-center justify-center gap-2 text-muted-foreground select-none">
+            <div className="flex-1 min-h-0 relative" style={{ background: 'var(--term-bg, #0f0f0f)' }}>
+              {/* Always keep TerminalPane mounted so xterm buffer is never lost on pop-in */}
+              <div className={poppedOutIds.has(term.id) ? 'invisible absolute inset-0' : 'w-full h-full'}>
+                <TerminalPane
+                  ref={el => { if (el) paneRefs.current.set(term.id, el) }}
+                  id={term.id}
+                  isVisible={isActive && !poppedOutIds.has(term.id)}
+                  cwd={term.cwd}
+                  onKill={() => window.electronAPI?.pty.kill(term.id)}
+                  onCwdChange={(newCwd) => updateTermCwd(term.id, newCwd)}
+                />
+              </div>
+              {poppedOutIds.has(term.id) && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-muted-foreground select-none">
                   <ExternalLink className="h-5 w-5 opacity-40" />
                   <span className="text-xs opacity-40">Terminal is popped out</span>
                   <button
-                    onClick={() => {
-                      window.electronAPI?.pty.popout?.(term.id, term.title)
-                    }}
+                    onClick={() => window.electronAPI?.pty.popout?.(term.id, term.title)}
                     className="text-xs text-primary/60 hover:text-primary transition-colors mt-1"
                   >
                     Focus window
                   </button>
                 </div>
-              ) : (
-                <TerminalPane
-                  ref={el => { if (el) paneRefs.current.set(term.id, el) }}
-                  id={term.id}
-                  isVisible={isActive}
-                  cwd={term.cwd}
-                  onKill={() => window.electronAPI?.pty.kill(term.id)}
-                  onCwdChange={(newCwd) => updateTermCwd(term.id, newCwd)}
-                />
               )}
             </div>
           </div>
         ))}
 
-        <button
-          onClick={addTerm}
-          className="flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-border hover:border-primary/50 hover:bg-accent/10 transition-colors text-muted-foreground hover:text-foreground group"
-        >
-          <div className="flex items-center justify-center h-12 w-12 rounded-full border-2 border-dashed border-current group-hover:border-primary/50 transition-colors">
-            <Plus className="h-6 w-6" />
-          </div>
-          <span className="text-xs">New Terminal</span>
-        </button>
+        {terms.length < 4 && (
+          <button
+            onClick={addTerm}
+            className="flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-border hover:border-primary/50 hover:bg-accent/10 transition-colors text-muted-foreground hover:text-foreground group"
+          >
+            <div className="flex items-center justify-center h-12 w-12 rounded-full border-2 border-dashed border-current group-hover:border-primary/50 transition-colors">
+              <Plus className="h-6 w-6" />
+            </div>
+            <span className="text-xs">New Terminal</span>
+          </button>
+        )}
+        {Array.from({ length: Math.max(0, 3 - terms.length) }).map((_, i) => (
+          <div key={`empty-${i}`} />
+        ))}
       </div>
     </div>
   )
