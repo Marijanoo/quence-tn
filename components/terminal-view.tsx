@@ -4,10 +4,12 @@ import { useEffect, useRef, useCallback, useState, forwardRef, useImperativeHand
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
-import { X, Plus, TerminalSquare, Copy, Check, ExternalLink } from 'lucide-react'
+import { X, Plus, TerminalSquare, Copy, Check, ExternalLink, Folder, FolderOpen, ChevronRight } from 'lucide-react'
 import { generateId } from '@/lib/utils'
 import { cn } from '@/lib/utils'
 import '@xterm/xterm/css/xterm.css'
+
+// ── theme ─────────────────────────────────────────────────────────────────────
 
 function getCssVar(name: string, fallback: string) {
   if (typeof document === 'undefined') return fallback
@@ -34,10 +36,26 @@ function getTermTheme() {
   }
 }
 
+// ── types ─────────────────────────────────────────────────────────────────────
+
 interface TermTab {
   id: string
   title: string
   cwd: string
+  folderId: string | null  // null = root
+}
+
+interface TermFolder {
+  id: string
+  name: string
+  parentId: string | null
+}
+
+interface SavedState {
+  terms: { id: string; title: string; cwd: string; folderId: string | null }[]
+  folders: { id: string; name: string; parentId: string | null }[]
+  counter: number
+  folderCounter: number
 }
 
 interface TerminalPaneHandle {
@@ -45,14 +63,26 @@ interface TerminalPaneHandle {
   getSnapshot: () => string
 }
 
-const TerminalPane = forwardRef<TerminalPaneHandle, { id: string; isVisible: boolean; cwd: string; onKill: () => void; onCwdChange: (cwd: string) => void }>(
-function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
+// Match a Windows cmd prompt like "C:\Users\Foo>"
+const PROMPT_RE = /([A-Za-z]:[^\r\n>]*?)>/
+
+// ── TerminalPane ──────────────────────────────────────────────────────────────
+
+const TerminalPane = forwardRef<TerminalPaneHandle, {
+  id: string
+  isVisible: boolean
+  cwd: string
+  onKill: () => void
+  onCwdChange: (cwd: string) => void
+}>(function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
   const containerRef = useRef<HTMLDivElement>(null)
   const fitAddonRef = useRef<FitAddon | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const mountedRef = useRef(false)
-  // Exposed so the parent can trigger intentional PTY kill (tab close)
   const killRef = useRef(onKill)
+  const isVisibleRef = useRef(isVisible)
+  const lastDimsRef = useRef<{ cols: number; rows: number } | null>(null)
+  const suppressResizeRef = useRef(false)
   killRef.current = onKill
 
   useImperativeHandle(ref, () => ({
@@ -61,9 +91,7 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
       if (!term) return
       const buf = term.buffer.active
       const lines: string[] = []
-      for (let i = 0; i < buf.length; i++) {
-        lines.push(buf.getLine(i)?.translateToString(true) ?? '')
-      }
+      for (let i = 0; i < buf.length; i++) lines.push(buf.getLine(i)?.translateToString(true) ?? '')
       navigator.clipboard.writeText(lines.join('\n').trimEnd())
     },
     getSnapshot: () => {
@@ -71,14 +99,10 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
       if (!term) return ''
       const buf = term.buffer.active
       const lines: string[] = []
-      for (let i = 0; i < buf.length; i++) {
-        lines.push(buf.getLine(i)?.translateToString(true) ?? '')
-      }
-      // Trim trailing blank lines
+      for (let i = 0; i < buf.length; i++) lines.push(buf.getLine(i)?.translateToString(true) ?? '')
       let end = lines.length - 1
       while (end > 0 && lines[end] === '') end--
       const trimmed = lines.slice(0, end + 1)
-      // Collapse runs of blank lines to a single blank line
       const collapsed: string[] = []
       let prevBlank = false
       for (const line of trimmed) {
@@ -112,14 +136,12 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
     fitAddon.fit()
     fitAddonRef.current = fitAddon
     termRef.current = term
+    lastDimsRef.current = { cols: term.cols, rows: term.rows }
 
-    // Start PTY at saved cwd
     window.electronAPI.pty.create(id, term.cols, term.rows, cwd)
 
-    // PTY → xterm, parse prompt to track cwd
     const onData = (data: string) => {
       term.write(data)
-      // Strip ANSI codes then look for a cmd prompt to extract cwd
       const plain = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
       const match = plain.match(PROMPT_RE)
       if (match) onCwdChange(match[1])
@@ -129,36 +151,29 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
     window.electronAPI.pty.onExit(id, onExit)
     window.electronAPI.pty.ready(id)
 
-    // Intercept clipboard and select-all shortcuts
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       if (e.type !== 'keydown') return true
       const mod = e.ctrlKey || e.metaKey
-
-      // Ctrl/Cmd+V or Ctrl+Shift+V — paste
       if ((mod && e.key === 'v') || (e.ctrlKey && e.shiftKey && e.key === 'V')) {
         navigator.clipboard.readText().then(text => {
           if (text) try { window.electronAPI!.pty.write(id, text) } catch {}
         }).catch(() => {})
         return false
       }
-      // Ctrl/Cmd+C or Ctrl+Shift+C — copy selection (if any), else pass through as interrupt
       if ((mod && e.key === 'c') || (e.ctrlKey && e.shiftKey && e.key === 'C')) {
         if (term.hasSelection()) {
           navigator.clipboard.writeText(term.getSelection()).catch(() => {})
           return false
         }
-        // No selection: let Ctrl+C pass through as PTY interrupt
-        if (e.shiftKey) return false // Ctrl+Shift+C with no selection — just swallow
+        if (e.shiftKey) return false
         return true
       }
       return true
     })
 
-    // Block xterm's built-in paste so our handler is the only one writing to the PTY
     const onPaste = (e: Event) => e.preventDefault()
     containerRef.current?.addEventListener('paste', onPaste, true)
 
-    // Right-click to paste
     const onContextMenu = (e: Event) => {
       e.preventDefault()
       navigator.clipboard.readText().then(text => {
@@ -167,12 +182,10 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
     }
     containerRef.current?.addEventListener('contextmenu', onContextMenu, true)
 
-    // xterm → PTY (node-pty handles echo natively)
     const dataDisposable = term.onData(data => {
       try { window.electronAPI!.pty.write(id, data) } catch {}
     })
 
-    // Resize observer — debounced via rAF, skip when container has no dimensions (hidden)
     let rafId = 0
     const ro = new ResizeObserver(() => {
       cancelAnimationFrame(rafId)
@@ -180,8 +193,14 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
         try {
           const el = containerRef.current
           if (!el || el.offsetWidth === 0 || el.offsetHeight === 0) return
+          if (!isVisibleRef.current) return
           fitAddon.fit()
-          window.electronAPI!.pty.resize(id, term.cols, term.rows)
+          if (suppressResizeRef.current) { lastDimsRef.current = { cols: term.cols, rows: term.rows }; return }
+          const { cols, rows } = term
+          if (!lastDimsRef.current || lastDimsRef.current.cols !== cols || lastDimsRef.current.rows !== rows) {
+            lastDimsRef.current = { cols, rows }
+            window.electronAPI!.pty.resize(id, cols, rows)
+          }
         } catch {}
       })
     })
@@ -195,8 +214,6 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
       containerRef.current?.removeEventListener('contextmenu', onContextMenu, true)
       window.electronAPI!.pty.offData(id)
       window.electronAPI!.pty.offExit(id)
-      // Do NOT kill the PTY here — this cleanup runs on every re-render/hot-reload.
-      // PTY is killed only when the tab is explicitly closed (via onKill).
       term.dispose()
       termRef.current = null
       fitAddonRef.current = null
@@ -204,9 +221,15 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
     }
   }, [id])
 
-  // Re-fit and restore viewport when becoming visible after being hidden
   useEffect(() => {
+    const wasVisible = isVisibleRef.current
+    isVisibleRef.current = isVisible
     if (!isVisible) return
+    // Suppress PTY resize during the pop-in layout transition to avoid SIGWINCH blank lines.
+    if (!wasVisible) {
+      suppressResizeRef.current = true
+      setTimeout(() => { suppressResizeRef.current = false }, 300)
+    }
     const t1 = setTimeout(() => {
       try {
         fitAddonRef.current?.fit()
@@ -214,7 +237,6 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
         termRef.current?.scrollToBottom()
       } catch {}
     }, 50)
-    // Second pass — canvas renderer may need an extra tick after layout settles
     const t2 = setTimeout(() => {
       try {
         fitAddonRef.current?.fit()
@@ -223,53 +245,67 @@ function TerminalPane({ id, isVisible, cwd, onKill, onCwdChange }, ref) {
       } catch {}
     }, 150)
     return () => { clearTimeout(t1); clearTimeout(t2) }
-  }, [isVisible])
+  }, [isVisible, id])
 
   return <div ref={containerRef} className="w-full h-full" style={{ padding: '4px 6px' }} />
 })
 
-interface SavedState { terms: { id: string; title: string; cwd: string }[]; counter: number }
-
-// Match a Windows cmd prompt like "C:\Users\Foo>" — strip ANSI escape codes first
-const PROMPT_RE = /([A-Za-z]:[^\r\n>]*?)>/
+// ── TerminalView ──────────────────────────────────────────────────────────────
 
 export function TerminalView({ isActive, onCountChange }: { isActive: boolean; onCountChange?: (count: number) => void }) {
   const [terms, setTerms] = useState<TermTab[]>([])
+  const [folders, setFolders] = useState<TermFolder[]>([])
   const [homedir, setHomedir] = useState('~')
   const [activeTermId, setActiveTermId] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [stats, setStats] = useState<Record<string, { cpu: number; memory: number }>>({})
   const [dragOverId, setDragOverId] = useState<string | null>(null)
   const [poppedOutIds, setPoppedOutIds] = useState<Set<string>>(new Set())
+  const [folderStack, setFolderStack] = useState<string[]>([]) // stack of folder IDs, [] = root
+  const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
   const counterRef = useRef(1)
+  const folderCounterRef = useRef(1)
   const paneRefs = useRef<Map<string, TerminalPaneHandle>>(new Map())
   const dragIdRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
   const termsRef = useRef<TermTab[]>([])
+  const foldersRef = useRef<TermFolder[]>([])
 
-  // Report count to parent
+  // Current folder ID is the top of the stack (null = root)
+  const currentFolderId = folderStack.length > 0 ? folderStack[folderStack.length - 1] : null
+
+  const visibleTerms = terms.filter(t => t.folderId === currentFolderId)
+  const visibleFolders = folders.filter(f => f.parentId === currentFolderId)
+
+  const totalItems = visibleTerms.length + visibleFolders.length
+
   useEffect(() => { onCountChange?.(terms.length) }, [terms.length, onCountChange])
 
-  // Clear popped-out state when the popout window is closed or popped back in
   useEffect(() => {
     const clear = (id: string) => setPoppedOutIds(prev => { const next = new Set(prev); next.delete(id); return next })
     window.electronAPI?.pty.onPopoutClosed?.(clear)
     window.electronAPI?.pty.onPopIn?.(clear)
   }, [])
 
-  // Keep termsRef in sync so save helper always has fresh state
   useEffect(() => { termsRef.current = terms }, [terms])
+  useEffect(() => { foldersRef.current = folders }, [folders])
 
-  // Save to main-process file whenever terms change (survives renderer reloads)
+  // Save state whenever terms or folders change
   useEffect(() => {
     if (!initializedRef.current) return
-    const state: SavedState | null = terms.length > 0
-      ? { terms: terms.map(t => ({ id: t.id, title: t.title, cwd: t.cwd })), counter: counterRef.current }
+    const state: SavedState | null = (terms.length > 0 || folders.length > 0)
+      ? {
+          terms: terms.map(t => ({ id: t.id, title: t.title, cwd: t.cwd, folderId: t.folderId })),
+          folders: folders.map(f => ({ id: f.id, name: f.name, parentId: f.parentId })),
+          counter: counterRef.current,
+          folderCounter: folderCounterRef.current,
+        }
       : null
     window.electronAPI?.pty.saveState?.(state)
-  }, [terms])
+  }, [terms, folders])
 
-  // Init: load state from main process, claim live PTY IDs, kill orphans
+  // Init: load state
   useEffect(() => {
     if (!window.electronAPI?.pty) return
     Promise.all([
@@ -287,19 +323,23 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
       })()
       initializedRef.current = true
       if (saved && saved.terms.length > 0) {
-        const restored = saved.terms.map(s => ({
+        const restoredTerms = saved.terms.map(s => ({
           id: s.id || generateId(),
           title: s.title,
           cwd: s.cwd || (h as string),
+          folderId: s.folderId ?? null,
         }))
+        const restoredFolders = (saved.folders ?? []).map(f => ({ id: f.id, name: f.name, parentId: f.parentId ?? null }))
         counterRef.current = saved.counter
-        termsRef.current = restored
-        setTerms(restored)
-        setActiveTermId(restored[0].id)
-        // Kill any PTYs from a previous session that we're not restoring
-        window.electronAPI!.pty.claim?.(restored.map(t => t.id))
+        folderCounterRef.current = saved.folderCounter ?? 1
+        termsRef.current = restoredTerms
+        foldersRef.current = restoredFolders
+        setTerms(restoredTerms)
+        setFolders(restoredFolders)
+        setActiveTermId(restoredTerms[0].id)
+        window.electronAPI!.pty.claim?.(restoredTerms.map(t => t.id))
       } else {
-        const initial = [{ id: generateId(), title: `Terminal ${counterRef.current++}`, cwd: h as string }]
+        const initial = [{ id: generateId(), title: `Terminal ${counterRef.current++}`, cwd: h as string, folderId: null }]
         termsRef.current = initial
         setTerms(initial)
         setActiveTermId(initial[0].id)
@@ -310,13 +350,61 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
 
   const addTerm = useCallback(() => {
     const id = generateId()
+    const newTerm = { id, title: `Terminal ${counterRef.current++}`, cwd: homedir, folderId: currentFolderId }
     setTerms(prev => {
-      const next = [...prev, { id, title: `Terminal ${counterRef.current++}`, cwd: homedir }]
+      const next = [...prev, newTerm]
       termsRef.current = next
       return next
     })
     setActiveTermId(id)
-  }, [homedir])
+  }, [homedir, currentFolderId])
+
+  const addFolder = useCallback(() => {
+    const id = generateId()
+    const newFolder: TermFolder = { id, name: `Folder ${folderCounterRef.current++}`, parentId: currentFolderId }
+    setFolders(prev => {
+      const next = [...prev, newFolder]
+      foldersRef.current = next
+      return next
+    })
+    setRenamingFolderId(id)
+    setRenameValue(newFolder.name)
+  }, [currentFolderId])
+
+  const renameFolder = useCallback((id: string, name: string) => {
+    setFolders(prev => {
+      const next = prev.map(f => f.id === id ? { ...f, name: name.trim() || f.name } : f)
+      foldersRef.current = next
+      return next
+    })
+    setRenamingFolderId(null)
+  }, [])
+
+  const deleteFolder = useCallback((id: string) => {
+    // Collect all descendant folder IDs recursively
+    const collectDescendants = (folderId: string, allFolders: TermFolder[]): string[] => {
+      const children = allFolders.filter(f => f.parentId === folderId)
+      return [folderId, ...children.flatMap(c => collectDescendants(c.id, allFolders))]
+    }
+    const toDelete = new Set(collectDescendants(id, foldersRef.current))
+    // Move all terminals in deleted folders to root
+    setTerms(prev => {
+      const next = prev.map(t => toDelete.has(t.folderId ?? '') ? { ...t, folderId: null } : t)
+      termsRef.current = next
+      return next
+    })
+    setFolders(prev => {
+      const next = prev.filter(f => !toDelete.has(f.id))
+      foldersRef.current = next
+      return next
+    })
+    // Pop stack back to before the deleted folder if we're inside it
+    setFolderStack(prev => {
+      const idx = prev.indexOf(id)
+      if (idx === -1) return prev
+      return prev.slice(0, idx)
+    })
+  }, [])
 
   const closeTerm = useCallback((id: string) => {
     window.electronAPI?.pty.kill(id)
@@ -367,13 +455,116 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
     })
   }, [])
 
+  // Build breadcrumb from stack
+  const breadcrumb = folderStack.map(id => folders.find(f => f.id === id))
+
+  // Count running terminals per folder (including nested) for badge
+  const termsInFolder = (folderId: string) => {
+    const collectIds = (id: string): string[] => {
+      const children = folders.filter(f => f.parentId === id)
+      return [id, ...children.flatMap(c => collectIds(c.id))]
+    }
+    const allIds = new Set(collectIds(folderId))
+    return terms.filter(t => allIds.has(t.folderId ?? '')).length
+  }
+
+  const canAddMore = totalItems < 4
+
   return (
     <div className="flex flex-col w-full h-full bg-background overflow-hidden">
+      {/* Breadcrumb bar when inside a folder */}
+      {folderStack.length > 0 && (
+        <div className="flex items-center gap-1 px-3 h-8 border-b border-border bg-card shrink-0 overflow-x-auto">
+          <button
+            onClick={() => setFolderStack([])}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors shrink-0"
+          >
+            <TerminalSquare className="h-3 w-3" />
+            Home
+          </button>
+          {breadcrumb.map((folder, i) => (
+            <div key={folder?.id ?? i} className="flex items-center gap-1 shrink-0">
+              <ChevronRight className="h-3 w-3 text-muted-foreground/40" />
+              {i < breadcrumb.length - 1 ? (
+                <button
+                  onClick={() => setFolderStack(prev => prev.slice(0, i + 1))}
+                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  <Folder className="h-3 w-3" />
+                  {folder?.name ?? 'Folder'}
+                </button>
+              ) : (
+                <span className="flex items-center gap-1 text-xs text-foreground font-medium">
+                  <FolderOpen className="h-3 w-3 text-muted-foreground/60" />
+                  {folder?.name ?? 'Folder'}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       <div
         className="grid grid-cols-2 gap-3 p-3 flex-1 min-h-0"
         style={{ gridTemplateRows: 'repeat(2, minmax(0, 1fr))' }}
       >
-        {terms.map(term => (
+        {/* Folder tiles (only at root) */}
+        {visibleFolders.map(folder => (
+          <div
+            key={folder.id}
+            className="flex flex-col rounded-lg border border-border bg-card overflow-hidden hover:border-primary/40 transition-colors cursor-pointer group"
+            onClick={() => setFolderStack(prev => [...prev, folder.id])}
+          >
+            <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-card shrink-0">
+              <Folder className="h-3.5 w-3.5 text-primary/60 shrink-0" />
+              {renamingFolderId === folder.id ? (
+                <input
+                  autoFocus
+                  value={renameValue}
+                  onChange={e => setRenameValue(e.target.value)}
+                  onKeyDown={e => {
+                    e.stopPropagation()
+                    if (e.key === 'Enter') renameFolder(folder.id, renameValue)
+                    if (e.key === 'Escape') { renameFolder(folder.id, folder.name); setRenamingFolderId(null) }
+                  }}
+                  onBlur={() => renameFolder(folder.id, renameValue)}
+                  onClick={e => e.stopPropagation()}
+                  className="flex-1 min-w-0 text-xs font-medium bg-transparent outline-none border-b border-primary/50 text-foreground"
+                />
+              ) : (
+                <span
+                  className="text-xs font-medium text-foreground flex-1 min-w-0 truncate"
+                  onDoubleClick={e => { e.stopPropagation(); setRenamingFolderId(folder.id); setRenameValue(folder.name) }}
+                >
+                  {folder.name}
+                </span>
+              )}
+              <button
+                onClick={e => { e.stopPropagation(); setRenamingFolderId(folder.id); setRenameValue(folder.name) }}
+                className="opacity-0 group-hover:opacity-100 text-xs text-muted-foreground hover:text-foreground transition-all shrink-0 px-1"
+                title="Rename"
+              >
+                ✎
+              </button>
+              <button
+                onClick={e => { e.stopPropagation(); deleteFolder(folder.id) }}
+                className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400 transition-all shrink-0"
+                title="Delete folder"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div className="flex flex-col items-center justify-center flex-1 gap-2 text-muted-foreground select-none">
+              <FolderOpen className="h-8 w-8 opacity-20" />
+              <span className="text-xs opacity-50">
+                {termsInFolder(folder.id)} terminal{termsInFolder(folder.id) !== 1 ? 's' : ''}
+              </span>
+            </div>
+          </div>
+        ))}
+
+        {/* Terminal tiles */}
+        {visibleTerms.map(term => (
           <div
             key={term.id}
             onDragOver={e => { e.preventDefault(); setDragOverId(term.id) }}
@@ -385,22 +576,22 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
               setDragOverId(null)
             }}
             className={cn(
-              "flex flex-col rounded-lg border overflow-hidden transition-colors",
+              'flex flex-col rounded-lg border overflow-hidden transition-colors',
               dragOverId === term.id && dragIdRef.current !== term.id
-                ? "border-primary/60 bg-primary/5"
-                : "border-border"
+                ? 'border-primary/60 bg-primary/5'
+                : 'border-border'
             )}
             onClick={() => setActiveTermId(term.id)}
           >
-            {/* Drag handle is only the header — avoids Blink crashing when dragging a div containing xterm canvas */}
             <div
               draggable
               onDragStart={e => { e.stopPropagation(); dragIdRef.current = term.id }}
               onDragEnd={() => { dragIdRef.current = null; setDragOverId(null) }}
               className={cn(
-              "flex items-center gap-2 px-3 py-1.5 border-b shrink-0 cursor-grab active:cursor-grabbing",
-              activeTermId === term.id ? "bg-primary/15 border-primary/40" : "bg-card border-border"
-            )}>
+                'flex items-center gap-2 px-3 py-1.5 border-b shrink-0 cursor-grab active:cursor-grabbing',
+                activeTermId === term.id ? 'bg-primary/15 border-primary/40' : 'bg-card border-border'
+              )}
+            >
               <TerminalSquare className="h-3.5 w-3.5 text-green-400 shrink-0" />
               <span className="text-xs font-medium text-foreground truncate">{term.title}</span>
               <span className="text-xs text-muted-foreground truncate flex-1">{term.cwd}</span>
@@ -426,12 +617,10 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
                   setPoppedOutIds(prev => new Set(prev).add(term.id))
                 }}
                 className={cn(
-                  "transition-colors shrink-0",
-                  poppedOutIds.has(term.id)
-                    ? "text-primary"
-                    : "text-muted-foreground hover:text-foreground"
+                  'transition-colors shrink-0',
+                  poppedOutIds.has(term.id) ? 'text-primary' : 'text-muted-foreground hover:text-foreground'
                 )}
-                title={poppedOutIds.has(term.id) ? "Already popped out" : "Pop out"}
+                title={poppedOutIds.has(term.id) ? 'Already popped out' : 'Pop out'}
               >
                 <ExternalLink className="h-3.5 w-3.5" />
               </button>
@@ -443,7 +632,6 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
               </button>
             </div>
             <div className="flex-1 min-h-0 relative" style={{ background: 'var(--term-bg, #0f0f0f)' }}>
-              {/* Always keep TerminalPane mounted so xterm buffer is never lost on pop-in */}
               <div className={poppedOutIds.has(term.id) ? 'invisible absolute inset-0' : 'w-full h-full'}>
                 <TerminalPane
                   ref={el => { if (el) paneRefs.current.set(term.id, el) }}
@@ -470,18 +658,28 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
           </div>
         ))}
 
-        {terms.length < 4 && (
-          <button
-            onClick={addTerm}
-            className="flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-border hover:border-primary/50 hover:bg-accent/10 transition-colors text-muted-foreground hover:text-foreground group"
-          >
-            <div className="flex items-center justify-center h-12 w-12 rounded-full border-2 border-dashed border-current group-hover:border-primary/50 transition-colors">
-              <Plus className="h-6 w-6" />
-            </div>
-            <span className="text-xs">New Terminal</span>
-          </button>
+        {/* Add tile */}
+        {canAddMore && (
+          <div className="flex flex-col rounded-lg border-2 border-dashed border-border overflow-hidden">
+            <button
+              onClick={addTerm}
+              className="flex items-center justify-center gap-2 flex-1 hover:bg-accent/10 hover:border-primary/50 transition-colors text-muted-foreground hover:text-foreground group border-b border-dashed border-border"
+            >
+              <Plus className="h-4 w-4" />
+              <span className="text-xs">New Terminal</span>
+            </button>
+            <button
+              onClick={addFolder}
+              className="flex items-center justify-center gap-2 flex-1 hover:bg-accent/10 transition-colors text-muted-foreground hover:text-foreground group"
+            >
+              <Folder className="h-4 w-4" />
+              <span className="text-xs">New Folder</span>
+            </button>
+          </div>
         )}
-        {Array.from({ length: Math.max(0, 3 - terms.length) }).map((_, i) => (
+
+        {/* Empty grid fillers */}
+        {Array.from({ length: Math.max(0, 3 - totalItems) }).map((_, i) => (
           <div key={`empty-${i}`} />
         ))}
       </div>
