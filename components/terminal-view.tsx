@@ -563,10 +563,11 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
           </div>
         ))}
 
-        {/* Terminal tiles */}
-        {visibleTerms.map(term => (
+        {/* Terminal tiles — render all to preserve xterm state; hide non-current via CSS */}
+        {terms.map(term => (
           <div
             key={term.id}
+            style={term.folderId !== currentFolderId ? { display: 'none' } : undefined}
             onDragOver={e => { e.preventDefault(); setDragOverId(term.id) }}
             onDragLeave={() => setDragOverId(prev => prev === term.id ? null : prev)}
             onDrop={e => {
@@ -636,7 +637,7 @@ export function TerminalView({ isActive, onCountChange }: { isActive: boolean; o
                 <TerminalPane
                   ref={el => { if (el) paneRefs.current.set(term.id, el) }}
                   id={term.id}
-                  isVisible={isActive && !poppedOutIds.has(term.id)}
+                  isVisible={isActive && term.folderId === currentFolderId && !poppedOutIds.has(term.id)}
                   cwd={term.cwd}
                   onKill={() => window.electronAPI?.pty.kill(term.id)}
                   onCwdChange={(newCwd) => updateTermCwd(term.id, newCwd)}
